@@ -1,0 +1,198 @@
+/*
+ * Copyright (c) 2013-2014 Linaro Ltd.
+ * Copyright (c) 2015-2017 HiSilicon Technologies Co., Ltd.
+ *
+ * This program is free software; you can redistribute  it and/or modify it
+ * under  the terms of  the GNU General  Public License as published by the
+ * Free Software Foundation;  either version 2 of the  License, or (at your
+ * option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ */
+
+/dts-v1/;
+#include "hi3518ev300.dtsi"
+
+/ {
+	model = "Board tmp47 0.0.0";
+	compatible = "hisilicon,hi3518ev300";
+
+	memory {
+		device_type = "memory";
+		reg = <0x40000000 0x20000000>;
+	};
+
+	gpio-keys {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		compatible = "gpio-keys";
+
+		down {
+			label = "GPIO Key DOWN";
+			linux,code = <4>;    /* KEY_3 */
+			gpios = <&gpio_ext 0 1>; /* I/O0, input, active low */
+		};
+
+		up {
+			label = "GPIO Key UP";
+			linux,code = <3>;    /* KEY_2 */
+			gpios = <&gpio_ext 1 1>; /* I/O1, input, active low */
+		};
+
+		enter {
+			label = "GPIO Key ENTER";
+			linux,code = <2>;    /* KEY_1 */
+			gpios = <&gpio_ext 2 1>; /* I/O2, input, active low */
+		};
+
+		cancel {
+			label = "GPIO Key CANCEL";
+			linux,code = <5>;    /* KEY_4 */
+			gpios = <&gpio_ext 3 1>; /* I/O3, input, active low */
+		};
+	};
+};
+
+
+&uart0 {
+	status = "okay";
+};
+
+&uart1 {
+	status = "disabled";
+};
+
+&uart2 {
+	status = "okay";
+};
+
+&i2c_bus0 {
+	status = "okay";
+	clock-frequency = <100000>;
+
+	/* PCA9554PW (A0..A2 = 0) at 0x20, INT -> GPIO6_2 */
+	gpio_ext: pca9554@20 {
+		compatible = "nxp,pca9554";
+		gpio-controller;
+		#gpio-cells = <2>;
+		reg = <0x20>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupt-parent = <&gpio_chip6>;
+		interrupts = <2 0x8>;
+	};
+};
+
+&i2c_bus1 {
+    status = "okay";
+    clock-frequency = <100000>;
+};
+
+&i2c_bus2 {
+    status = "okay";
+    clock-frequency = <100000>;
+	#address-cells = <1>;
+	#size-cells = <0>;
+};
+
+&spi_bus0{
+	status = "okay";
+	num-cs = <1>; 
+	ili9488@0 {
+		compatible = "ilitek,ili9488";
+		reg = <0>; 
+		spi-max-frequency = <24000000>;
+		dc-gpios = <&gpio_chip7 0 1>;
+		reset-gpios = <&gpio_chip7 2 0>;
+		backlight-gpios = <&gpio_ext 7 0>;
+		width = <320>;
+		height = <480>;
+		regwidth = <8>;     
+        buswidth = <8>;    
+        bpp = <16>;         
+	};
+};
+
+&dual_timer0 {
+	status = "okay";
+};
+
+&mdio0 {
+	hisilicon,phy-reset-delays-us = <10000 20000 150000>;
+	phy0: ethernet-phy@1 {
+		reg = <1>;
+	};
+};
+
+&hisi_femac0 {
+	mac-address = [00 00 00 00 00 00];
+	phy-mode = "mii";
+	phy-handle = <&phy0>;
+	status = "okay";
+};
+
+&fmc {
+	status = "disabled";
+};
+
+&mmc0 {
+	non-removable;
+	status = "okay";
+};
+
+/* redefine base address for mmc1 iocfg */
+&iocfg_ctrl2 {
+	reg = <0x100C0000 0x10000>;
+};
+
+&mmc1 {
+	status = "okay";
+	no-1-8-v;
+	max-frequency = <25000000>;
+	no-mmc;
+	dsr = <0xffff>;
+	cd-gpios = <&gpio_chip2 0 1>;
+	pwr-gpios = <&gpio_chip5 0 0>; /* 0 = active high */
+	disable-wp;
+};
+
+&gpio_chip0 {
+	status = "okay";
+};
+
+&gpio_chip1 {
+	status = "okay";
+};
+
+&gpio_chip2 {
+	status = "okay";
+};
+
+&gpio_chip4 {
+	status = "okay";
+};
+
+&gpio_chip5 {
+	status = "okay";
+};
+
+&gpio_chip6 {
+	status = "okay";
+	interrupt-controller;
+	#interrupt-cells = <2>;
+};
+
+&gpio_chip7 {
+	status = "okay";
+};
+
+&gpio_chip8 {
+	status = "okay";
+};
