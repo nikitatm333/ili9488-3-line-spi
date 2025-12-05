@@ -102,22 +102,21 @@
 	#size-cells = <0>;
 };
 
-&spi_bus0{
-	status = "okay";
-	num-cs = <1>; 
-	ili9488@0 {
-		compatible = "ilitek,ili9488";
-		reg = <0>; 
-		spi-max-frequency = <24000000>;
-		dc-gpios = <&gpio_chip7 0 1>;
-		reset-gpios = <&gpio_chip7 2 0>;
-		backlight-gpios = <&gpio_ext 7 0>;
-		width = <320>;
-		height = <480>;
-		regwidth = <8>;     
-        buswidth = <8>;    
-        bpp = <16>;         
-	};
+&spi_bus0 {
+    status = "okay";
+    num-cs = <1>;
+    
+    ili9488@0 {
+        compatible = "ilitek,ili9488";
+        reg = <0>;
+        spi-max-frequency = <5000000>;
+        spi-cpol;
+        spi-cpha;
+        reset-gpios = <&gpio_chip7 2 0>;
+        backlight-gpios = <&gpio_ext 7 0>;
+        width = <320>;
+        height = <480>;
+    };
 };
 
 &dual_timer0 {
