@@ -164,7 +164,7 @@ static void ili9488_fill_color_3bit(struct spi_device *spi, u8 color)
     ili9488_data(spi, 0x00); /* Start Y low */
     ili9488_data(spi, 0x01); /* End Y high */
     ili9488_data(spi, 0xDF); /* End Y low (479 = 0x01DF) */
-    к
+    
     /* Команда начала записи в RAM */
     ili9488_cmd(spi, 0x2C); /* RAMWR */
     
