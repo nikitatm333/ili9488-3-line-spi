@@ -1,5 +1,23 @@
 /*
  * ili9488_3bit.c - Драйвер для ILI9488 в 3-битном SPI режиме
+ *
+ * КЛЮЧЕВОЕ: используем hardware 9-bit SPI (bits_per_word = 9).
+ *
+ * Проблема предыдущих версий: при 8-bit SPI отправлялось 2 байта (16 бит)
+ * на одно 9-битное слово. Лишние 7 бит накапливались между CS-пульсами
+ * и сдвигали D/C-бит, из-за чего часть пикселей трактовалась как команды.
+ * Результат — заливка только 3/4 экрана.
+ *
+ * С bits_per_word = 9: каждый u16 в буфере = ровно 9 бит на проводе.
+ * Никаких лишних бит, никакого накопления.
+ *
+ * Формат 9-битного слова (u16, MSB first):
+ *   бит 8 (bit15 не используется, значащий MSB = бит8) = D/C
+ *   биты 7..0 = данные
+ *   → u16 = (dc << 8) | data
+ *
+ * Заливка: чанки по 2048 пикселей (18432 бит @ 5МГц = ~3.7 мс),
+ * хорошо укладывается в таймаут PL022 polling.
  */
 
 #include <linux/module.h>
@@ -8,289 +26,290 @@
 #include <linux/delay.h>
 #include <linux/of.h>
 #include <linux/gpio/consumer.h>
+#include <linux/slab.h>
 
 #define DRIVER_NAME "ili9488_3bit"
 
+#define LCD_WIDTH   320
+#define LCD_HEIGHT  480
+
+/* Пикселей за один spi_write при заливке */
+#define FILL_CHUNK  2048
+
 struct ili9488_dev {
-    struct spi_device *spi;
-    struct gpio_desc *reset_gpiod;
-    struct gpio_desc *bl_gpiod;
+	struct spi_device *spi;
+	struct gpio_desc  *reset_gpiod;
+	struct gpio_desc  *bl_gpiod;
 };
 
-/* Отправка 9-битного слова (D/C + 8-бит данных) через 2 байта */
-static int ili9488_send_9bit(struct spi_device *spi, u8 dc, u8 data, const char *type)
+/* ------------------------------------------------------------------ */
+/* Отправка одного 9-битного слова                                     */
+/* u16 value: бит8 = D/C, биты7..0 = данные                           */
+/* ------------------------------------------------------------------ */
+
+static int spi_9bit_word(struct spi_device *spi, u16 word)
 {
-    u8 tx_buf[2];
-    struct spi_transfer t = {
-        .tx_buf = tx_buf,
-        .len = 2,
-    };
-    struct spi_message m;
-    int ret;
-    
-    /* Формируем 9-битное слово как 2 байта:
-     * 1-й байт: D/C + 7 старших бит данных
-     * 2-й байт: 1 младший бит данных в старшей позиции
-     */
-    tx_buf[0] = (dc << 7) | (data >> 1);
-    tx_buf[1] = (data & 0x01) << 7;
-    
-    spi_message_init(&m);
-    spi_message_add_tail(&t, &m);
-    
-    pr_debug("ILI9488: %s: dc=%d, data=0x%02X -> buf[0]=0x%02X, buf[1]=0x%02X\n",
-             type, dc, data, tx_buf[0], tx_buf[1]);
-    
-    ret = spi_sync(spi, &m);
-    if (ret)
-        pr_err("ILI9488: %s failed: %d\n", type, ret);
-    
-    return ret;
+	struct spi_transfer t = {
+		.tx_buf        = &word,
+		.len           = 2,         /* 2 байта в памяти... */
+		.bits_per_word = 9,         /* ...но на проводе ровно 9 бит */
+	};
+	struct spi_message m;
+
+	spi_message_init(&m);
+	spi_message_add_tail(&t, &m);
+	return spi_sync(spi, &m);
 }
 
-/* Отправка команды (D/C=0) */
-static int ili9488_cmd(struct spi_device *spi, u8 cmd)
+static inline int lcd_cmd(struct spi_device *spi, u8 cmd)
 {
-    return ili9488_send_9bit(spi, 0, cmd, "CMD");
+	/* D/C=0 → бит 8 = 0 */
+	return spi_9bit_word(spi, (u16)cmd);
 }
 
-/* Отправка данных (D/C=1) */
-static int ili9488_data(struct spi_device *spi, u8 data)
+static inline int lcd_data(struct spi_device *spi, u8 data)
 {
-    return ili9488_send_9bit(spi, 1, data, "DATA");
+	/* D/C=1 → бит 8 = 1 */
+	return spi_9bit_word(spi, 0x100 | data);
 }
 
-/* Отправка нескольких данных подряд */
-static int ili9488_data_bulk(struct spi_device *spi, const u8 *data, size_t len)
+/* ------------------------------------------------------------------ */
+/* Аппаратный сброс                                                    */
+/* ------------------------------------------------------------------ */
+
+static void ili9488_hw_reset(struct ili9488_dev *lcd)
 {
-    int i, ret = 0;
-    
-    for (i = 0; i < len; i++) {
-        ret = ili9488_data(spi, data[i]);
-        if (ret)
-            break;
-    }
-    
-    return ret;
+	if (!lcd->reset_gpiod)
+		return;
+	gpiod_set_value_cansleep(lcd->reset_gpiod, 0);
+	msleep(20);
+	gpiod_set_value_cansleep(lcd->reset_gpiod, 1);
+	msleep(120);
+	pr_info("ILI9488: hw reset done\n");
 }
 
-/* Сброс дисплея через GPIO */
-static void ili9488_hardware_reset(struct ili9488_dev *lcd)
-{
-    if (!lcd->reset_gpiod)
-        return;
-    
-    pr_info("ILI9488: Hardware reset...\n");
-    
-    /* Активный низкий уровень - сброс */
-    gpiod_set_value_cansleep(lcd->reset_gpiod, 0);
-    msleep(20);
-    gpiod_set_value_cansleep(lcd->reset_gpiod, 1);
-    msleep(120); /* Обязательная задержка после сброса */
-    
-    pr_info("ILI9488: Hardware reset done\n");
-}
+/* ------------------------------------------------------------------ */
+/* Инициализация                                                        */
+/* ------------------------------------------------------------------ */
 
-/* Инициализация в 3-битном режиме (RGB 1-1-1) */
-static void ili9488_3bit_init(struct ili9488_dev *lcd)
+static void ili9488_init(struct ili9488_dev *lcd)
 {
     struct spi_device *spi = lcd->spi;
-    
-    pr_info("ILI9488: Starting 3-bit mode initialization\n");
-    
-    /* 1. Аппаратный сброс */
-    ili9488_hardware_reset(lcd);
-    
-    /* 2. Software Reset */
-    ili9488_cmd(spi, 0x01); /* SWRESET */
-    msleep(150);
-    
-    /* 3. Exit Sleep */
-    ili9488_cmd(spi, 0x11); /* SLEEP OUT */
-    msleep(120);
-    
-    /* 4. Interface Pixel Format - ВАЖНО: 3-bit/pixel для 3-line SPI */
-    ili9488_cmd(spi, 0x3A); /* COLMOD */
-    ili9488_data(spi, 0x01); /* 3-bit/pixel (RGB 1-1-1) - 8 цветов */
+
+    ili9488_hw_reset(lcd);
+
+    lcd_cmd(spi, 0x01); msleep(150); /* SWRESET   */
+    lcd_cmd(spi, 0x11); msleep(120); /* SLEEP OUT */
+
+    lcd_cmd(spi, 0x3A);              /* COLMOD: 3-bit/pixel */
+    lcd_data(spi, 0x01);
     msleep(10);
-    
-    /* 5. Memory Access Control */
-    ili9488_cmd(spi, 0x36); /* MADCTL */
-    ili9488_data(spi, 0x48); /* MY=0, MX=0, MV=0, ML=0, BGR=1, MH=0 */
+
+    lcd_cmd(spi, 0x36);              /* MADCTL: MX=1, BGR=1 — как в рабочем коде */
+    lcd_data(spi, 0x48);
     msleep(10);
-    
-    /* 6. Display Inversion ON */
-    ili9488_cmd(spi, 0x21); /* Display Inversion ON */
-    msleep(10);
-    
-    /* 7. Normal Display Mode ON */
-    ili9488_cmd(spi, 0x13); /* NORON */
-    msleep(10);
-    
-    /* 8. Display ON */
-    ili9488_cmd(spi, 0x29); /* DISPON */
-    msleep(50);
-    
-    pr_info("ILI9488: 3-bit mode initialization complete\n");
+
+    lcd_cmd(spi, 0x21); msleep(10);  /* INVON — нужен для IPS Normally Black */
+
+    lcd_cmd(spi, 0x13); msleep(10);  /* NORON  */
+    lcd_cmd(spi, 0x29); msleep(50);  /* DISPON */
+
+    pr_info("ILI9488: init done\n");
 }
 
-/* Цвета в 3-битном режиме (R[2], G[1], B[0]) */
-#define COLOR_BLACK     0x00    /* 000 */
-#define COLOR_BLUE      0x01    /* 001 */
-#define COLOR_GREEN     0x02    /* 010 */
-#define COLOR_CYAN      0x03    /* 011 */
-#define COLOR_RED       0x04    /* 100 */
-#define COLOR_MAGENTA   0x05    /* 101 */
-#define COLOR_YELLOW    0x06    /* 110 */
-#define COLOR_WHITE     0x07    /* 111 */
+/* ------------------------------------------------------------------ */
+/* Установка окна + RAMWR                                              */
+/* ------------------------------------------------------------------ */
 
-/* Заливка всего экрана указанным цветом (3-битный режим) */
-static void ili9488_fill_color_3bit(struct spi_device *spi, u8 color)
+static void ili9488_set_window(struct spi_device *spi,
+			       u16 x0, u16 y0, u16 x1, u16 y1)
 {
-    int total_pixels = 320 * 480;
-    int i;
-    
-    pr_info("ILI9488: Заливка цветом 0x%02X (3-битный режим)...\n", color);
-    
-    /* Устанавливаем область рисования (весь экран 320x480) */
-    ili9488_cmd(spi, 0x2A); /* CASET */
-    ili9488_data(spi, 0x00); /* Start X high */
-    ili9488_data(spi, 0x00); /* Start X low */
-    ili9488_data(spi, 0x01); /* End X high */
-    ili9488_data(spi, 0x3F); /* End X low (319 = 0x013F) */
-    
-    ili9488_cmd(spi, 0x2B); /* PASET */
-    ili9488_data(spi, 0x00); /* Start Y high */
-    ili9488_data(spi, 0x00); /* Start Y low */
-    ili9488_data(spi, 0x01); /* End Y high */
-    ili9488_data(spi, 0xDF); /* End Y low (479 = 0x01DF) */
-    
-    /* Команда начала записи в RAM */
-    ili9488_cmd(spi, 0x2C); /* RAMWR */
-    
-    /* Отправляем все пиксели - 1 байт на пиксель в 3-битном режиме */
-    for (i = 0; i < total_pixels; i++) {
-        ili9488_data(spi, color);
-        
-        /* Прогресс каждые 5000 пикселей */
-        if (i % 5000 == 0 && i > 0)
-            pr_info("ILI9488: Заполнено %d пикселей из %d\n", i, total_pixels);
-    }
-    
-    pr_info("ILI9488: Заливка завершена\n");
+	lcd_cmd(spi,  0x2A);
+	lcd_data(spi, x0 >> 8); lcd_data(spi, x0 & 0xFF);
+	lcd_data(spi, x1 >> 8); lcd_data(spi, x1 & 0xFF);
+
+	lcd_cmd(spi,  0x2B);
+	lcd_data(spi, y0 >> 8); lcd_data(spi, y0 & 0xFF);
+	lcd_data(spi, y1 >> 8); lcd_data(spi, y1 & 0xFF);
+
+	lcd_cmd(spi,  0x2C); /* RAMWR */
 }
 
-/* Probe функция */
+/* ------------------------------------------------------------------ */
+/* Цвета (RGB 1-1-1)                                                   */
+/* ------------------------------------------------------------------ */
+
+#define COLOR_BLACK   0x00
+#define COLOR_BLUE    0x01
+#define COLOR_GREEN   0x02
+#define COLOR_CYAN    0x03
+#define COLOR_RED     0x04
+#define COLOR_MAGENTA 0x05
+#define COLOR_YELLOW  0x06
+#define COLOR_WHITE   0x07
+
+/* ------------------------------------------------------------------ */
+/* Заливка экрана                                                       */
+/*                                                                      */
+/* Буфер u16[FILL_CHUNK]: каждый элемент = 0x100|color (D/C=1).       */
+/* spi_write с bits_per_word=9 отправляет ровно 9 бит на слово.       */
+/* Чанк 2048 пикс × 9 бит @ 5МГц = ~3.7 мс → нет таймаута PL022.    */
+/* ------------------------------------------------------------------ */
+
+static void ili9488_fill(struct spi_device *spi, u8 color)
+{
+	const int total = LCD_WIDTH * LCD_HEIGHT; /* 153600 */
+	u16 pixel = 0x100 | (color & 0x07);
+	u16 *buf;
+	struct spi_transfer t;
+	struct spi_message m;
+	int i, sent = 0, ret;
+
+	buf = kmalloc(FILL_CHUNK * sizeof(u16), GFP_KERNEL);
+	if (!buf) {
+		pr_err("ILI9488: fill: kmalloc failed\n");
+		return;
+	}
+
+	for (i = 0; i < FILL_CHUNK; i++)
+		buf[i] = pixel;
+
+	pr_info("ILI9488: fill color=0x%02X\n", color);
+
+	ili9488_set_window(spi, 0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1);
+
+	while (sent < total) {
+		int n = min(FILL_CHUNK, total - sent);
+
+		memset(&t, 0, sizeof(t));
+		t.tx_buf        = buf;
+		t.len           = n * sizeof(u16);
+		t.bits_per_word = 9;
+
+		spi_message_init(&m);
+		spi_message_add_tail(&t, &m);
+
+		ret = spi_sync(spi, &m);
+		if (ret) {
+			pr_err("ILI9488: fill: spi err=%d at px %d\n",
+			       ret, sent);
+			break;
+		}
+		sent += n;
+	}
+
+	kfree(buf);
+	pr_info("ILI9488: fill done (%d px)\n", sent);
+}
+
+/* ------------------------------------------------------------------ */
+/* Probe / Remove                                                       */
+/* ------------------------------------------------------------------ */
+
 static int ili9488_3bit_probe(struct spi_device *spi)
 {
-    struct device *dev = &spi->dev;
-    struct ili9488_dev *lcd;
-    int ret;
-    
-    pr_info("ILI9488: Загружаю драйвер (3-битный режим, IM[2:0]=101)\n");
-    
-    lcd = devm_kzalloc(dev, sizeof(*lcd), GFP_KERNEL);
-    if (!lcd)
-        return -ENOMEM;
-    
-    lcd->spi = spi;
-    spi_set_drvdata(spi, lcd);
-    
-    /* Получаем GPIO */
-    lcd->reset_gpiod = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
-    if (IS_ERR(lcd->reset_gpiod)) {
-        dev_err(dev, "Не могу получить GPIO сброса\n");
-        return PTR_ERR(lcd->reset_gpiod);
-    }
-    
-    lcd->bl_gpiod = devm_gpiod_get_optional(dev, "backlight", GPIOD_OUT_LOW);
-    if (IS_ERR(lcd->bl_gpiod)) {
-        dev_err(dev, "Не могу получить GPIO подсветки\n");
-        return PTR_ERR(lcd->bl_gpiod);
-    }
-    
-    /* Настраиваем SPI */
-    spi->mode = SPI_MODE_3; /* CPOL=1, CPHA=1 */
-    spi->bits_per_word = 8; /* 8-битный SPI, но отправляем 2 байта для 9 бит */
-    spi->max_speed_hz = 1000000; /* 1 МГц для надежности в 3-битном режиме */
-    
-    ret = spi_setup(spi);
-    if (ret) {
-        dev_err(dev, "Ошибка настройки SPI: %d\n", ret);
-        return ret;
-    }
-    
-    pr_info("ILI9488: SPI настроен: mode=3, speed=%u, bits=%u\n", 
-            spi->max_speed_hz, spi->bits_per_word);
-    
-    /* Включаем подсветку если есть */
-    if (lcd->bl_gpiod) {
-        gpiod_set_value_cansleep(lcd->bl_gpiod, 1);
-        msleep(10);
-        pr_info("ILI9488: Подсветка включена\n");
-    }
-    
-    /* Инициализация в 3-битном режиме */
-    ili9488_3bit_init(lcd);
-    
-    /* Тест разных цветов */
-    msleep(100);
-    
-    pr_info("ILI9488: Тест красного цвета...\n");
-    ili9488_fill_color_3bit(spi, COLOR_RED); /* Красный */
-    msleep(2000);
-    
-    pr_info("ILI9488: Тест зеленого цвета...\n");
-    ili9488_fill_color_3bit(spi, COLOR_GREEN); /* Зеленый */
-    msleep(2000);
-    
-    pr_info("ILI9488: Тест синего цвета...\n");
-    ili9488_fill_color_3bit(spi, COLOR_BLUE); /* Синий */
-    msleep(2000);
-    
-    pr_info("ILI9488: Тест белого цвета...\n");
-    ili9488_fill_color_3bit(spi, COLOR_WHITE); /* Белый */
-    msleep(2000);
-    
-    pr_info("ILI9488: Тест черного цвета...\n");
-    ili9488_fill_color_3bit(spi, COLOR_BLACK); /* Черный */
-    
-    pr_info("ILI9488: Драйвер успешно загружен!\n");
-    return 0;
+	struct device      *dev = &spi->dev;
+	struct ili9488_dev *lcd;
+	int ret;
+
+	pr_info("ILI9488: probe start\n");
+
+	lcd = devm_kzalloc(dev, sizeof(*lcd), GFP_KERNEL);
+	if (!lcd)
+		return -ENOMEM;
+
+	lcd->spi = spi;
+	spi_set_drvdata(spi, lcd);
+
+	lcd->reset_gpiod = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
+	if (IS_ERR(lcd->reset_gpiod)) {
+		dev_err(dev, "reset GPIO error\n");
+		return PTR_ERR(lcd->reset_gpiod);
+	}
+
+	lcd->bl_gpiod = devm_gpiod_get_optional(dev, "backlight", GPIOD_OUT_LOW);
+	if (IS_ERR(lcd->bl_gpiod)) {
+		dev_err(dev, "backlight GPIO error\n");
+		return PTR_ERR(lcd->bl_gpiod);
+	}
+
+	/* Hardware 9-bit SPI — контроллер сам отправляет ровно 9 бит */
+	spi->mode          = SPI_MODE_3;
+	spi->bits_per_word = 9;
+	spi->max_speed_hz  = 5000000;
+
+	ret = spi_setup(spi);
+	if (ret) {
+		dev_err(dev, "spi_setup 9-bit failed: %d\n", ret);
+		/*
+		 * Некоторые SPI-контроллеры не поддерживают 9-bit.
+		 * Если spi_setup вернул ошибку — плата не поддерживает.
+		 */
+		return ret;
+	}
+
+	pr_info("ILI9488: SPI mode=%u speed=%u bpw=%u\n",
+		spi->mode, spi->max_speed_hz, spi->bits_per_word);
+
+	if (lcd->bl_gpiod) {
+		gpiod_set_value_cansleep(lcd->bl_gpiod, 1);
+		msleep(10);
+		pr_info("ILI9488: backlight ON\n");
+	}
+
+	ili9488_init(lcd);
+
+	pr_info("ILI9488: RED\n");
+	ili9488_fill(spi, COLOR_RED);
+	msleep(2000);
+
+	pr_info("ILI9488: GREEN\n");
+	ili9488_fill(spi, COLOR_GREEN);
+	msleep(2000);
+
+	pr_info("ILI9488: BLUE\n");
+	ili9488_fill(spi, COLOR_BLUE);
+	msleep(2000);
+
+	pr_info("ILI9488: WHITE\n");
+	ili9488_fill(spi, COLOR_WHITE);
+	msleep(2000);
+
+	pr_info("ILI9488: BLACK\n");
+	ili9488_fill(spi, COLOR_BLACK);
+
+	pr_info("ILI9488: probe done\n");
+	return 0;
 }
 
 static int ili9488_3bit_remove(struct spi_device *spi)
 {
-    struct ili9488_dev *lcd = spi_get_drvdata(spi);
-    
-    if (lcd && lcd->bl_gpiod) {
-        gpiod_set_value_cansleep(lcd->bl_gpiod, 0);
-        pr_info("ILI9488: Подсветка выключена\n");
-    }
-    
-    pr_info("ILI9488: Драйвер выгружен\n");
-    return 0;
+	struct ili9488_dev *lcd = spi_get_drvdata(spi);
+
+	if (lcd && lcd->bl_gpiod)
+		gpiod_set_value_cansleep(lcd->bl_gpiod, 0);
+
+	pr_info("ILI9488: removed\n");
+	return 0;
 }
 
 static const struct of_device_id ili9488_3bit_of_match[] = {
-    { .compatible = "ilitek,ili9488" },
-    { .compatible = "ili9488" },
-    {},
+	{ .compatible = "ilitek,ili9488" },
+	{ },
 };
 MODULE_DEVICE_TABLE(of, ili9488_3bit_of_match);
 
 static struct spi_driver ili9488_3bit_driver = {
-    .driver = {
-        .name = DRIVER_NAME,
-        .of_match_table = ili9488_3bit_of_match,
-        .owner = THIS_MODULE,
-    },
-    .probe = ili9488_3bit_probe,
-    .remove = ili9488_3bit_remove,
+	.driver = {
+		.name           = DRIVER_NAME,
+		.of_match_table = ili9488_3bit_of_match,
+	},
+	.probe  = ili9488_3bit_probe,
+	.remove = ili9488_3bit_remove,
 };
 
 module_spi_driver(ili9488_3bit_driver);
 
 MODULE_AUTHOR("tnv");
-MODULE_DESCRIPTION("Драйвер ILI9488 в 3-битном SPI режиме (8 цветов)");
+MODULE_DESCRIPTION("ILI9488 3-bit SPI, hardware 9-bit mode");
 MODULE_LICENSE("GPL");
