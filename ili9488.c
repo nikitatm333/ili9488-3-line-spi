@@ -266,7 +266,7 @@ static int ili9488_probe(struct spi_device *spi)
 	/* SPI setup */
 	spi->mode = SPI_MODE_3;
 	spi->bits_per_word = 9;
-	spi->max_speed_hz = 5000000;
+	spi->max_speed_hz = 15000000;
 	ret = spi_setup(spi);
 	if (ret) {
 		dev_err(&spi->dev, "spi_setup failed: %d\n", ret);
