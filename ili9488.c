@@ -1,58 +1,50 @@
 /*
- * ili9488_3bit.c - Драйвер для ILI9488 в 3-битном SPI режиме
+ * ili9488_fb.c - Framebuffer driver for ILI9488 in 3-bit mode (8 colors)
  *
- * КЛЮЧЕВОЕ: используем hardware 9-bit SPI (bits_per_word = 9).
- *
- * Проблема предыдущих версий: при 8-bit SPI отправлялось 2 байта (16 бит)
- * на одно 9-битное слово. Лишние 7 бит накапливались между CS-пульсами
- * и сдвигали D/C-бит, из-за чего часть пикселей трактовалась как команды.
- * Результат — заливка только 3/4 экрана.
- *
- * С bits_per_word = 9: каждый u16 в буфере = ровно 9 бит на проводе.
- * Никаких лишних бит, никакого накопления.
- *
- * Формат 9-битного слова (u16, MSB first):
- *   бит 8 (bit15 не используется, значащий MSB = бит8) = D/C
- *   биты 7..0 = данные
- *   → u16 = (dc << 8) | data
- *
- * Заливка: чанки по 2048 пикселей (18432 бит @ 5МГц = ~3.7 мс),
- * хорошо укладывается в таймаут PL022 polling.
+ * Работает в том же режиме, что и ili9488_3bit.c (COLMOD=0x01)
+ * Использует hardware 9-bit SPI (bits_per_word=9)
  */
 
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/fb.h>
 #include <linux/spi/spi.h>
-#include <linux/delay.h>
 #include <linux/of.h>
 #include <linux/gpio/consumer.h>
 #include <linux/slab.h>
+#include <linux/delay.h>
+#include <linux/vmalloc.h>
 
-#define DRIVER_NAME "ili9488_3bit"
+#define DRIVER_NAME  "ili9488_fb"
 
-#define LCD_WIDTH   320
-#define LCD_HEIGHT  480
+#define LCD_WIDTH    320
+#define LCD_HEIGHT   480
+#define LCD_BPP      8                    /* 1 байт = 1 пиксель (3 бита цвета) */
+#define LCD_BUFSIZE  (LCD_WIDTH * LCD_HEIGHT)   /* 153600 байт */
 
-/* Пикселей за один spi_write при заливке */
-#define FILL_CHUNK  2048
+/* Чанк для flush (как в рабочем 3bit драйвере) */
+#define FLUSH_CHUNK  2048
 
-struct ili9488_dev {
+/* Deferred IO ~50 fps */
+#define DEFIO_DELAY  (HZ / 50)
+
+struct ili9488_par {
 	struct spi_device *spi;
+	struct fb_info    *info;
+	u8                *vmem;           /* framebuffer in RAM */
 	struct gpio_desc  *reset_gpiod;
 	struct gpio_desc  *bl_gpiod;
 };
 
 /* ------------------------------------------------------------------ */
-/* Отправка одного 9-битного слова                                     */
-/* u16 value: бит8 = D/C, биты7..0 = данные                           */
+/* SPI 9-bit helpers (точно как в твоём рабочем драйвере)           */
 /* ------------------------------------------------------------------ */
-
-static int spi_9bit_word(struct spi_device *spi, u16 word)
+static int spi_9bit(struct spi_device *spi, u16 word)
 {
 	struct spi_transfer t = {
 		.tx_buf        = &word,
-		.len           = 2,         /* 2 байта в памяти... */
-		.bits_per_word = 9,         /* ...но на проводе ровно 9 бит */
+		.len           = 2,
+		.bits_per_word = 9,
 	};
 	struct spi_message m;
 
@@ -63,253 +55,323 @@ static int spi_9bit_word(struct spi_device *spi, u16 word)
 
 static inline int lcd_cmd(struct spi_device *spi, u8 cmd)
 {
-	/* D/C=0 → бит 8 = 0 */
-	return spi_9bit_word(spi, (u16)cmd);
+	return spi_9bit(spi, (u16)cmd);           /* D/C=0 */
 }
 
 static inline int lcd_data(struct spi_device *spi, u8 data)
 {
-	/* D/C=1 → бит 8 = 1 */
-	return spi_9bit_word(spi, 0x100 | data);
+	return spi_9bit(spi, 0x100 | (u16)data);  /* D/C=1 */
 }
 
 /* ------------------------------------------------------------------ */
-/* Аппаратный сброс                                                    */
+/* Hardware reset                                                    */
 /* ------------------------------------------------------------------ */
-
-static void ili9488_hw_reset(struct ili9488_dev *lcd)
+static void ili9488_hw_reset(struct ili9488_par *par)
 {
-	if (!lcd->reset_gpiod)
+	if (!par->reset_gpiod)
 		return;
-	gpiod_set_value_cansleep(lcd->reset_gpiod, 0);
+
+	gpiod_set_value_cansleep(par->reset_gpiod, 0);
 	msleep(20);
-	gpiod_set_value_cansleep(lcd->reset_gpiod, 1);
+	gpiod_set_value_cansleep(par->reset_gpiod, 1);
 	msleep(120);
-	pr_info("ILI9488: hw reset done\n");
 }
 
-/* ------------------------------------------------------------------ */
-/* Инициализация                                                        */
-/* ------------------------------------------------------------------ */
 
-static void ili9488_init(struct ili9488_dev *lcd)
+static void ili9488_init_display(struct ili9488_par *par)
 {
-    struct spi_device *spi = lcd->spi;
+	struct spi_device *spi = par->spi;
 
-    ili9488_hw_reset(lcd);
+	ili9488_hw_reset(par);
 
-    lcd_cmd(spi, 0x01); msleep(150); /* SWRESET   */
-    lcd_cmd(spi, 0x11); msleep(120); /* SLEEP OUT */
+	lcd_cmd(spi, 0x01); msleep(150); /* SWRESET */
+	lcd_cmd(spi, 0x11); msleep(120); /* SLEEP OUT */
 
-    lcd_cmd(spi, 0x3A);              /* COLMOD: 3-bit/pixel */
-    lcd_data(spi, 0x01);
-    msleep(10);
+	lcd_cmd(spi, 0x3A);              /* COLMOD: 3-bit/pixel */
+	lcd_data(spi, 0x01);
+	msleep(10);
 
-    lcd_cmd(spi, 0x36);              /* MADCTL: MX=1, BGR=1 — как в рабочем коде */
-    lcd_data(spi, 0x48);
-    msleep(10);
+	lcd_cmd(spi, 0x36);              /* MADCTL */
+	lcd_data(spi, 0x48);
+	msleep(10);
 
-    lcd_cmd(spi, 0x21); msleep(10);  /* INVON — нужен для IPS Normally Black */
+	lcd_cmd(spi, 0x21); msleep(10);  /* INVON */
+	lcd_cmd(spi, 0x13); msleep(10);  /* NORON */
+	lcd_cmd(spi, 0x29); msleep(50);  /* DISPON */
 
-    lcd_cmd(spi, 0x13); msleep(10);  /* NORON  */
-    lcd_cmd(spi, 0x29); msleep(50);  /* DISPON */
-
-    pr_info("ILI9488: init done\n");
+	pr_info("ILI9488: init_display done (3-bit mode)\n");
 }
 
 /* ------------------------------------------------------------------ */
-/* Установка окна + RAMWR                                              */
+/* Set window                                                        */
 /* ------------------------------------------------------------------ */
-
 static void ili9488_set_window(struct spi_device *spi,
 			       u16 x0, u16 y0, u16 x1, u16 y1)
 {
-	lcd_cmd(spi,  0x2A);
+	lcd_cmd(spi, 0x2A);
 	lcd_data(spi, x0 >> 8); lcd_data(spi, x0 & 0xFF);
 	lcd_data(spi, x1 >> 8); lcd_data(spi, x1 & 0xFF);
 
-	lcd_cmd(spi,  0x2B);
+	lcd_cmd(spi, 0x2B);
 	lcd_data(spi, y0 >> 8); lcd_data(spi, y0 & 0xFF);
 	lcd_data(spi, y1 >> 8); lcd_data(spi, y1 & 0xFF);
 
-	lcd_cmd(spi,  0x2C); /* RAMWR */
+	lcd_cmd(spi, 0x2C); /* RAMWR */
 }
 
 /* ------------------------------------------------------------------ */
-/* Цвета (RGB 1-1-1)                                                   */
+/* Flush — адаптировано под 8bpp (1 байт = 1 пиксель)               */
 /* ------------------------------------------------------------------ */
-
-#define COLOR_BLACK   0x00
-#define COLOR_BLUE    0x01
-#define COLOR_GREEN   0x02
-#define COLOR_CYAN    0x03
-#define COLOR_RED     0x04
-#define COLOR_MAGENTA 0x05
-#define COLOR_YELLOW  0x06
-#define COLOR_WHITE   0x07
-
-/* ------------------------------------------------------------------ */
-/* Заливка экрана                                                       */
-/*                                                                      */
-/* Буфер u16[FILL_CHUNK]: каждый элемент = 0x100|color (D/C=1).       */
-/* spi_write с bits_per_word=9 отправляет ровно 9 бит на слово.       */
-/* Чанк 2048 пикс × 9 бит @ 5МГц = ~3.7 мс → нет таймаута PL022.    */
-/* ------------------------------------------------------------------ */
-
-static void ili9488_fill(struct spi_device *spi, u8 color)
+static void ili9488_flush(struct ili9488_par *par)
 {
-	const int total = LCD_WIDTH * LCD_HEIGHT; /* 153600 */
-	u16 pixel = 0x100 | (color & 0x07);
-	u16 *buf;
-	struct spi_transfer t;
-	struct spi_message m;
-	int i, sent = 0, ret;
+	struct spi_device *spi = par->spi;
+	u8                *vmem = par->vmem;
+	u16               *chunk;
+	int                sent = 0;
+	int                total = LCD_WIDTH * LCD_HEIGHT;
+	int                ret;
 
-	buf = kmalloc(FILL_CHUNK * sizeof(u16), GFP_KERNEL);
-	if (!buf) {
-		pr_err("ILI9488: fill: kmalloc failed\n");
+	chunk = kmalloc(FLUSH_CHUNK * sizeof(u16), GFP_KERNEL);
+	if (!chunk)
 		return;
-	}
 
-	for (i = 0; i < FILL_CHUNK; i++)
-		buf[i] = pixel;
-
-	pr_info("ILI9488: fill color=0x%02X\n", color);
-
-	ili9488_set_window(spi, 0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1);
+	ili9488_set_window(spi, 0, 0, LCD_WIDTH-1, LCD_HEIGHT-1);
 
 	while (sent < total) {
-		int n = min(FILL_CHUNK, total - sent);
+		int n = min(FLUSH_CHUNK, total - sent);
+		int i;
 
-		memset(&t, 0, sizeof(t));
-		t.tx_buf        = buf;
-		t.len           = n * sizeof(u16);
-		t.bits_per_word = 9;
+		for (i = 0; i < n; i++)
+			chunk[i] = 0x100 | vmem[sent + i];   /* D/C = 1 */
+
+		struct spi_transfer t = {
+			.tx_buf        = chunk,
+			.len           = n * sizeof(u16),
+			.bits_per_word = 9,
+		};
+		struct spi_message m;
 
 		spi_message_init(&m);
 		spi_message_add_tail(&t, &m);
 
 		ret = spi_sync(spi, &m);
 		if (ret) {
-			pr_err("ILI9488: fill: spi err=%d at px %d\n",
-			       ret, sent);
+			dev_err(&spi->dev, "flush error %d at pixel %d\n", ret, sent);
 			break;
 		}
 		sent += n;
 	}
 
-	kfree(buf);
-	pr_info("ILI9488: fill done (%d px)\n", sent);
+	kfree(chunk);
 }
 
 /* ------------------------------------------------------------------ */
-/* Probe / Remove                                                       */
+/* Deferred IO                                                       */
 /* ------------------------------------------------------------------ */
-
-static int ili9488_3bit_probe(struct spi_device *spi)
+static void ili9488_deferred_io(struct fb_info *info,
+				struct list_head *pagelist)
 {
-	struct device      *dev = &spi->dev;
-	struct ili9488_dev *lcd;
+	ili9488_flush(info->par);
+}
+
+static struct fb_deferred_io ili9488_defio = {
+	.delay       = DEFIO_DELAY,
+	.deferred_io = ili9488_deferred_io,
+};
+
+/* ------------------------------------------------------------------ */
+/* fb_ops                                                            */
+/* ------------------------------------------------------------------ */
+static void ili9488_fb_fillrect(struct fb_info *info,
+				const struct fb_fillrect *rect)
+{
+	cfb_fillrect(info, rect);
+}
+
+static void ili9488_fb_copyarea(struct fb_info *info,
+				const struct fb_copyarea *area)
+{
+	cfb_copyarea(info, area);
+}
+
+static void ili9488_fb_imageblit(struct fb_info *info,
+				 const struct fb_image *image)
+{
+	cfb_imageblit(info, image);
+}
+
+static struct fb_ops ili9488_fbops = {
+	.owner        = THIS_MODULE,
+	.fb_fillrect  = ili9488_fb_fillrect,
+	.fb_copyarea  = ili9488_fb_copyarea,
+	.fb_imageblit = ili9488_fb_imageblit,
+};
+
+/* ------------------------------------------------------------------ */
+/* Screen info                                                       */
+/* ------------------------------------------------------------------ */
+static struct fb_fix_screeninfo ili9488_fix = {
+	.id          = "ili9488_fb",
+	.type        = FB_TYPE_PACKED_PIXELS,
+	.visual      = FB_VISUAL_TRUECOLOR,     /* можно PSEUDOCOLOR, но TRUECOLOR проще */
+	.accel       = FB_ACCEL_NONE,
+	.line_length = LCD_WIDTH,               /* 1 байт на пиксель */
+};
+
+static struct fb_var_screeninfo ili9488_var = {
+	.xres           = LCD_WIDTH,
+	.yres           = LCD_HEIGHT,
+	.xres_virtual   = LCD_WIDTH,
+	.yres_virtual   = LCD_HEIGHT,
+	.bits_per_pixel = LCD_BPP,
+	.red            = { .offset = 0, .length = 8, .msb_right = 0 },
+	.green          = { .offset = 0, .length = 8, .msb_right = 0 },
+	.blue           = { .offset = 0, .length = 8, .msb_right = 0 },
+	.transp         = { .offset = 0, .length = 0 },
+	.activate       = FB_ACTIVATE_NOW,
+	.vmode          = FB_VMODE_NONINTERLACED,
+};
+
+/* ------------------------------------------------------------------ */
+/* Probe                                                             */
+/* ------------------------------------------------------------------ */
+static int ili9488_probe(struct spi_device *spi)
+{
+	struct ili9488_par *par;
+	struct fb_info *info;
 	int ret;
 
-	pr_info("ILI9488: probe start\n");
+	dev_info(&spi->dev, "probe start\n");
 
-	lcd = devm_kzalloc(dev, sizeof(*lcd), GFP_KERNEL);
-	if (!lcd)
+	info = framebuffer_alloc(sizeof(struct ili9488_par), &spi->dev);
+	if (!info)
 		return -ENOMEM;
 
-	lcd->spi = spi;
-	spi_set_drvdata(spi, lcd);
+	par = info->par;
+	par->spi = spi;
+	par->info = info;
+	spi_set_drvdata(spi, par);
 
-	lcd->reset_gpiod = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
-	if (IS_ERR(lcd->reset_gpiod)) {
-		dev_err(dev, "reset GPIO error\n");
-		return PTR_ERR(lcd->reset_gpiod);
+	/* Allocate framebuffer memory */
+	par->vmem = vzalloc(LCD_BUFSIZE);
+	if (!par->vmem) {
+		ret = -ENOMEM;
+		goto err_fb_alloc;
 	}
 
-	lcd->bl_gpiod = devm_gpiod_get_optional(dev, "backlight", GPIOD_OUT_LOW);
-	if (IS_ERR(lcd->bl_gpiod)) {
-		dev_err(dev, "backlight GPIO error\n");
-		return PTR_ERR(lcd->bl_gpiod);
-	}
+	/* GPIOs */
+	par->reset_gpiod = devm_gpiod_get_optional(&spi->dev, "reset", GPIOD_OUT_LOW);
+	par->bl_gpiod    = devm_gpiod_get_optional(&spi->dev, "backlight", GPIOD_OUT_LOW);
 
-	/* Hardware 9-bit SPI — контроллер сам отправляет ровно 9 бит */
-	spi->mode          = SPI_MODE_3;
+	/* SPI setup */
+	spi->mode = SPI_MODE_3;
 	spi->bits_per_word = 9;
-	spi->max_speed_hz  = 5000000;
-
+	spi->max_speed_hz = 5000000;
 	ret = spi_setup(spi);
 	if (ret) {
-		dev_err(dev, "spi_setup 9-bit failed: %d\n", ret);
-		/*
-		 * Некоторые SPI-контроллеры не поддерживают 9-bit.
-		 * Если spi_setup вернул ошибку — плата не поддерживает.
-		 */
-		return ret;
+		dev_err(&spi->dev, "spi_setup failed: %d\n", ret);
+		goto err_vmem;
 	}
 
-	pr_info("ILI9488: SPI mode=%u speed=%u bpw=%u\n",
-		spi->mode, spi->max_speed_hz, spi->bits_per_word);
+	/* Fill fb_info */
+	info->fbops = &ili9488_fbops;
+	info->fix = ili9488_fix;
+	info->var = ili9488_var;
+	info->flags = FBINFO_DEFAULT | FBINFO_VIRTFB;
+	info->screen_base = (char __iomem *)par->vmem;
+	info->screen_size = LCD_BUFSIZE;
+	info->fix.smem_start = (unsigned long)par->vmem;
+	info->fix.smem_len = LCD_BUFSIZE;
 
-	if (lcd->bl_gpiod) {
-		gpiod_set_value_cansleep(lcd->bl_gpiod, 1);
+	/* Deferred IO */
+	info->fbdefio = &ili9488_defio;
+	fb_deferred_io_init(info);
+
+	/* Hardware init */
+	ili9488_init_display(par);
+
+	/* Backlight */
+	if (par->bl_gpiod) {
+		gpiod_set_value_cansleep(par->bl_gpiod, 1);
 		msleep(10);
-		pr_info("ILI9488: backlight ON\n");
 	}
 
-	ili9488_init(lcd);
+	/* Register */
+	ret = register_framebuffer(info);
+	if (ret) {
+		dev_err(&spi->dev, "register_framebuffer failed: %d\n", ret);
+		goto err_defio;
+	}
 
-	pr_info("ILI9488: RED\n");
-	ili9488_fill(spi, COLOR_RED);
-	msleep(2000);
+	dev_info(&spi->dev, "registered /dev/fb0, 320x480, 3-bit mode\n");
 
-	pr_info("ILI9488: GREEN\n");
-	ili9488_fill(spi, COLOR_GREEN);
-	msleep(2000);
+	/* Тестовые заливки как в твоём рабочем драйвере */
+	memset(par->vmem, 0x04, LCD_BUFSIZE);  /* RED */
+	ili9488_flush(par);
+	msleep(800);
 
-	pr_info("ILI9488: BLUE\n");
-	ili9488_fill(spi, COLOR_BLUE);
-	msleep(2000);
+	memset(par->vmem, 0x02, LCD_BUFSIZE);  /* GREEN */
+	ili9488_flush(par);
+	msleep(800);
 
-	pr_info("ILI9488: WHITE\n");
-	ili9488_fill(spi, COLOR_WHITE);
-	msleep(2000);
+	memset(par->vmem, 0x01, LCD_BUFSIZE);  /* BLUE */
+	ili9488_flush(par);
+	msleep(800);
 
-	pr_info("ILI9488: BLACK\n");
-	ili9488_fill(spi, COLOR_BLACK);
+	memset(par->vmem, 0x07, LCD_BUFSIZE);  /* WHITE */
+	ili9488_flush(par);
 
-	pr_info("ILI9488: probe done\n");
+	pr_info("ILI9488: test colors done\n");
+
 	return 0;
+
+err_defio:
+	fb_deferred_io_cleanup(info);
+err_vmem:
+	vfree(par->vmem);
+err_fb_alloc:
+	framebuffer_release(info);
+	return ret;
 }
 
-static int ili9488_3bit_remove(struct spi_device *spi)
+/* ------------------------------------------------------------------ */
+/* Remove                                                            */
+/* ------------------------------------------------------------------ */
+static int ili9488_remove(struct spi_device *spi)
 {
-	struct ili9488_dev *lcd = spi_get_drvdata(spi);
+	struct ili9488_par *par = spi_get_drvdata(spi);
+	struct fb_info *info = par->info;
 
-	if (lcd && lcd->bl_gpiod)
-		gpiod_set_value_cansleep(lcd->bl_gpiod, 0);
+	if (par->bl_gpiod)
+		gpiod_set_value_cansleep(par->bl_gpiod, 0);
 
-	pr_info("ILI9488: removed\n");
+	unregister_framebuffer(info);
+	fb_deferred_io_cleanup(info);
+	vfree(par->vmem);
+	framebuffer_release(info);
+
+	dev_info(&spi->dev, "removed\n");
 	return 0;
 }
 
-static const struct of_device_id ili9488_3bit_of_match[] = {
+/* ------------------------------------------------------------------ */
+static const struct of_device_id ili9488_fb_of_match[] = {
 	{ .compatible = "ilitek,ili9488" },
 	{ },
 };
-MODULE_DEVICE_TABLE(of, ili9488_3bit_of_match);
+MODULE_DEVICE_TABLE(of, ili9488_fb_of_match);
 
-static struct spi_driver ili9488_3bit_driver = {
+static struct spi_driver ili9488_fb_driver = {
 	.driver = {
 		.name           = DRIVER_NAME,
-		.of_match_table = ili9488_3bit_of_match,
+		.of_match_table = ili9488_fb_of_match,
 	},
-	.probe  = ili9488_3bit_probe,
-	.remove = ili9488_3bit_remove,
+	.probe  = ili9488_probe,
+	.remove = ili9488_remove,
 };
 
-module_spi_driver(ili9488_3bit_driver);
+module_spi_driver(ili9488_fb_driver);
 
 MODULE_AUTHOR("tnv");
-MODULE_DESCRIPTION("ILI9488 3-bit SPI, hardware 9-bit mode");
+MODULE_DESCRIPTION("ILI9488 framebuffer driver (3-bit mode, 8 colors)");
 MODULE_LICENSE("GPL");
